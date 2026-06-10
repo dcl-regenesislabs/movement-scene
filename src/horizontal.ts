@@ -1,7 +1,7 @@
 import { engine, InputAction, inputSystem, Transform } from '@dcl/sdk/ecs'
 import { Quaternion, Vector3 } from '@dcl/sdk/math';
 import { GLIDE_HORIZONTAL_SPEED, GLIDER_TURN_MAX_DEGREES_SEC, HORIZONTAL_ACCEL_TIME_AIR, HORIZONTAL_ACCEL_TIME_GROUND, HORIZONTAL_DAMP_TIME_AIR, HORIZONTAL_DAMP_TIME_GROUND, HORIZONTAL_STOP_DECEL_AIR, HORIZONTAL_STOP_DECEL_GROUND, TURN_FULL_TIME, TURN_MAX_DEGREES_SEC, VEC3_HORIZONTAL_MASK, VEC3_UP, VEC3_ZERO, VERTICAL_STOP_DECEL } from './constants';
-import { playerRotation, stepTime, velocity } from '.';
+import { landRecoverUntil, playerRotation, stepTime, time, velocity } from '.';
 import { grounded } from './ground';
 import { disableOrientation, jogSpeed, sprintSpeed, walkSpeed } from './parameters';
 import { isGliding } from './vertical';
@@ -97,6 +97,15 @@ function updateVelocity() {
   const targetSpeed = inputSystem.isPressed(InputAction.IA_MODIFIER) ? sprintSpeed
     : inputSystem.isPressed(InputAction.IA_WALK) ? walkSpeed
     : jogSpeed;
+
+  // Hard-landing recovery: ignore movement input for a beat after a heavy
+  // touchdown (set in index.ts landingAnimation). The ground damp/decel above
+  // brings the player to rest, so the recover clip plays in place instead of
+  // the avatar sliding away under input.
+  if (time < landRecoverUntil) {
+    Vector3.multiplyToRef(velocity, VEC3_HORIZONTAL_MASK, horizontalVelocity);
+    return;
+  }
 
   if (Vector3.lengthSquared(movementAxis) === 0 || targetSpeed === 0) {
     Vector3.multiplyToRef(velocity, VEC3_HORIZONTAL_MASK, horizontalVelocity);

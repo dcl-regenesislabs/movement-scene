@@ -2,7 +2,7 @@ import { AvatarAnimationState, AvatarMovement, AvatarMovementInfo, engine, Movem
 import { Quaternion, Vector3 } from '@dcl/sdk/math';
 import { getExplorerConfiguration } from '~system/EnvironmentApi';
 import { grounded, initGroundRaycast, updateGroundAdjust } from './ground';
-import { dampVelocity, orientation, relativeDegrees, updateHorizontalVelocity } from './horizontal';
+import { dampVelocity, movementAxis, orientation, relativeDegrees, updateHorizontalVelocity } from './horizontal';
 import { initStepCasts, isDoubleJump, isGliding, jumpStartHeight, updateVerticalVelocity } from './vertical';
 import { initParamters as initParameters } from './parameters';
 import { initWalkSystem, updateEngineWalk, consumeWalkResult } from './walk';
@@ -10,6 +10,7 @@ import { MAX_SPEED } from './constants';
 import { settings } from './settings';
 import { setupUi } from './ui';
 import { initGlider } from './glider';
+import { initTestTower } from './testTower';
 
 // Avatar-bus audio clip pools published via MovementAnimation.sounds. Engine
 // plays each listed clip once per frame on the avatar's local audio bus — the
@@ -113,6 +114,7 @@ export function main() {
   initStepCasts();
   initWalkSystem();
   initGlider();
+  initTestTower();
   setupUi();
 
   engine.addSystem(initFrame, 100000 + 1);
@@ -203,12 +205,35 @@ var prevJumpPhase: JumpPhase = 'none';
 var jumpVariation: JumpVariation = 'idle';
 // Chosen touchdown clip (a *_Jump_End or Hard_Landing), held across the landing.
 var landingClip: string | undefined = undefined;
+// True when the current landing came from a stunning drop (> stunDrop): the
+// clip plays out fully since input is locked. Non-stunning landings are
+// skippable/abortable by movement input.
+var landingLocked = false;
+// Scene time the current landing clip started, for the moving-landing blend-out.
+var landingStartTime = -Infinity;
+// Playback speed of the current landing clip (softLandSpeed for small drops).
+var landingSpeed = 1;
+// True when the current landing is a small-drop bob (sliced, see softLandTime).
+var landingSoft = false;
 
 // --- Glide turn rate ---
 // Smoothed avatar turn rate (deg/s), used to pick the left/right glide lean.
 // Computed each frame in applyMovement from the change in facing.
 var glidePrevOrientation = 0;
 export var glideTurnRate = 0;
+
+// --- Hard-landing recovery (stun) ---
+// Mirrors Unity explorer's StunCharacterSystem: movement input is suppressed
+// for settings.landRecoverTime after landing a drop > settings.stunDrop.
+// Tracked separately from maxUngroundedY because, like Unity, the stun
+// fall-height resets continuously while gliding — a controlled glide
+// touchdown only counts the drop after the glide ended, so it never stuns.
+export var landRecoverUntil = -Infinity;
+var stunTopY = -Infinity;
+
+// True while the avatar is already showing a glide pose — used to blend fast
+// on glide entry but slow (gliderFade) between glide poses.
+var wasGlidingPose = false;
 
 // --- Jog/run stop transition ---
 // True while the one-shot stop clip is playing out before settling to idle.
@@ -217,6 +242,9 @@ var stopping = false;
 // fast move when the avatar comes to a halt (deceleration passes through walk
 // speeds, so we can't rely on the immediately-previous frame's speed).
 var lastFastMoveTime = -Infinity;
+// When the current uninterrupted stretch of jog+ movement started — the stop
+// clip only plays if the run lasted at least settings.jogStopMinRun.
+var fastMoveStartTime = Infinity;
 
 // True once the engine reports a non-looped clip has played to its end.
 function clipFinished(src: string): boolean {
@@ -282,13 +310,18 @@ function jumpPhaseAnimation(newJump: boolean, horizontalSpeed: number): Movement
   const phaseChanged = jumpPhase !== prevJumpPhase;
   prevJumpPhase = jumpPhase;
 
+  // Fresh ground jump: snap into the start clip near-instantly (transJumpStart,
+  // platformer-style responsiveness) and optionally skip the clip's anticipation
+  // wind-up (jumpStartSkip) so the up-pose shows the moment the body launches.
+  const freshStart = newJump && jumpPhase === 'start';
+
   return {
     src,
     speed: 1,
     loop,
     idle: false,
-    transitionSeconds: settings.transAir,
-    playbackTime: phaseChanged ? 0 : undefined,
+    transitionSeconds: freshStart ? settings.transJumpStart : settings.transAir,
+    playbackTime: phaseChanged ? (freshStart ? settings.jumpStartSkip : 0) : undefined,
     sounds: newJump && jumpPhase === 'start' ? [pickRandom(JUMP_SOUNDS)] : [],
   };
 }
@@ -300,34 +333,74 @@ function landingAnimation(justLanded: boolean): MovementAnimation | null {
   if (settings.playLanding === 0) {
     requestingLanding = false;
     jumpPhase = 'none';
-    if (justLanded) maxUngroundedY = -Infinity;
+    if (justLanded) {
+      if (stunTopY - playerPosition.y > settings.stunDrop) landRecoverUntil = time + settings.landRecoverTime;
+      stunTopY = -Infinity;
+      maxUngroundedY = -Infinity;
+    }
     return null;
   }
 
+  // Landing while moving (and not stunned) shows the touchdown briefly, then
+  // blends out into locomotion after landRunBlend seconds instead of holding
+  // the planted-feet clip to completion (which reads as a sliding crouch).
+  // Only stunning drops (> stunDrop) play out compulsorily — there the input
+  // lockout holds the player in place anyway.
+  const moving = Vector3.lengthSquared(movementAxis) > 0;
+
   if (justLanded) {
     const drop = maxUngroundedY - playerPosition.y;
-    landingClip = drop > settings.hardLandingDrop ? CLIP_HARD_LANDING : JUMP_SETS[jumpVariation].end;
+    // Every landing shows a crouch-absorb bob: small drops reuse the
+    // Hard_Landing clip started partway in (softLandStart skips the deep
+    // crouch) and sped up (softLandSpeed), so it reads as a quick head-bob
+    // dip; big drops (> hardLandingDrop) play the clip in full from 0.
+    const soft = drop <= settings.hardLandingDrop;
+    landingClip = CLIP_HARD_LANDING;
+    landingSoft = soft;
+    landingSpeed = soft ? settings.softLandSpeed : 1;
+    landingLocked = stunTopY - playerPosition.y > settings.stunDrop;
+    landingStartTime = time;
+    // Stun: lock movement input after big drops (Unity: JumpHeightStun=10m,
+    // LongFallStunTime=0.75s). Uses the glide-aware stun tracker, so the
+    // hard-landing *clip* (drop > hardLandingDrop) can play without stunning.
+    if (landingLocked) landRecoverUntil = time + settings.landRecoverTime;
+    stunTopY = -Infinity;
     maxUngroundedY = -Infinity;
     jumpPhase = 'none';
     prevJumpPhase = 'none';
     return {
       src: landingClip,
-      speed: 1,
+      speed: landingSpeed,
       loop: false,
       idle: false,
       transitionSeconds: settings.transAir,
-      playbackTime: 0,
+      playbackTime: soft ? settings.softLandStart : 0,
       sounds: drop > 0.5 ? [pickRandom(LAND_SOUNDS)] : [],
     };
   }
 
   const clip = landingClip ?? JUMP_SETS[jumpVariation].end;
+  // Moving + non-stunning: let the touchdown show for landRunBlend seconds,
+  // then hand back to locomotion (which blends it out over transRun).
+  if (moving && !landingLocked && time - landingStartTime >= settings.landRunBlend) {
+    requestingLanding = false;
+    landingClip = undefined;
+    return null;
+  }
+  // Soft landings only show a slice of the clip (the absorb dip), then hand
+  // back to idle/locomotion, which crossfades the rest out — the Hard_Landing
+  // clip is too expressive to play out for a normal hop.
+  if (landingSoft && !landingLocked && time - landingStartTime >= settings.softLandTime) {
+    requestingLanding = false;
+    landingClip = undefined;
+    return null;
+  }
   if (clipFinished(clip)) {
     requestingLanding = false;
     landingClip = undefined;
     return null;
   }
-  return { src: clip, speed: 1, loop: false, idle: false, transitionSeconds: settings.transAir, sounds: [] };
+  return { src: clip, speed: landingSpeed, loop: false, idle: false, transitionSeconds: settings.transAir, sounds: [] };
 }
 
 // Detects whether the clip's playback time crossed any of the given trigger
@@ -352,19 +425,28 @@ function stepTriggered(prev: number, cur: number, duration: number, triggers: nu
 }
 
 function selectAnimation(): MovementAnimation {
+  if (!isGliding) wasGlidingPose = false;
   const jumpingOrFalling = jumpStartHeight !== undefined || !grounded;
   const newJump = jumpStartHeight !== undefined && prevJumpStartHeight === undefined;
   prevJumpStartHeight = jumpStartHeight;
 
   if (jumpingOrFalling) {
     maxUngroundedY = Math.max(maxUngroundedY, playerPosition.y);
+    // Gliding keeps resetting the stun height (Unity parity): only free-fall
+    // after the glide ends counts toward the stun drop.
+    stunTopY = isGliding ? playerPosition.y : Math.max(stunTopY, playerPosition.y);
   }
   // Ungrounded -> grounded transition: the frame the landing sound may fire.
   const justLanded = wasJumpingOrFalling && !jumpingOrFalling;
   wasJumpingOrFalling = jumpingOrFalling;
 
   const horizontalSpeed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-  if (horizontalSpeed > settings.walkRunThreshold) lastFastMoveTime = time;
+  if (horizontalSpeed > settings.walkRunThreshold) {
+    // Track when this stretch of jog+ movement began, so the stop clip can
+    // require a sustained run — a quick reposition tap shouldn't foot-plant.
+    if (time - lastFastMoveTime > 0.25) fastMoveStartTime = time;
+    lastFastMoveTime = time;
+  }
 
   if (jumpingOrFalling) {
     requestingLanding = true;
@@ -382,12 +464,18 @@ function selectAnimation(): MovementAnimation {
       else if (glideTurnRate < -settings.glideLeanRate) src = GLIDE_AVATAR.left;
       else if (horizontalSpeed > settings.glideForwardSpeed) src = GLIDE_AVATAR.forward;
       else src = GLIDE_AVATAR.idle;
+      // Entering the glide blends fast (transAir) so the pose keeps up with
+      // the glider deploying; once gliding, pose-to-pose changes crossfade at
+      // gliderFade — same time as the glider prop's blend (glider.ts) — so
+      // avatar and glider bank together and the hands stay on the handles.
+      const enteringGlide = !wasGlidingPose;
+      wasGlidingPose = true;
       return {
         src,
         speed: 1,
         loop: true,
         idle: false,
-        transitionSeconds: settings.transAir,
+        transitionSeconds: enteringGlide ? settings.transAir : settings.gliderFade,
         sounds: [],
       };
     }
@@ -420,7 +508,12 @@ function selectAnimation(): MovementAnimation {
   const forward = Vector3.rotate(Vector3.Forward(), playerRotation);
   const directionalVelLen = velocity.x * forward.x + velocity.z * forward.z;
 
-  if (horizontalSpeed > settings.moveGate) {
+  // Locomotion tiers only while there's actual movement input. With no keys
+  // held, the residual decelerating velocity (jog -> 0 passes through walk
+  // speeds for a few frames) would otherwise flash the walk clip — the
+  // "residual walking" shuffle — instead of going straight to stop/idle.
+  const hasMoveInput = Vector3.lengthSquared(movementAxis) > 0;
+  if (horizontalSpeed > settings.moveGate && hasMoveInput) {
     stopping = false; // moving again — cancel any pending stop
     // Tier 1: walk
     if (horizontalSpeed <= settings.walkRunThreshold) {
@@ -458,8 +551,13 @@ function selectAnimation(): MovementAnimation {
   // Jog/run stop: if we halted within a moment of moving at jog+ pace, play the
   // one-shot stop clip before settling into idle (Unity's Jog_Stop behaviour).
   if (settings.useJogStop !== 0) {
-    if (!stopping && time - lastFastMoveTime < 0.25) {
+    let newStop = false;
+    // Only foot-plant after a sustained run (jogStopMinRun) — brief taps and
+    // small repositions settle straight into idle instead.
+    const ranLongEnough = lastFastMoveTime - fastMoveStartTime >= settings.jogStopMinRun;
+    if (!stopping && time - lastFastMoveTime < 0.25 && ranLongEnough) {
       stopping = true;
+      newStop = true;
     }
     if (stopping) {
       if (clipFinished(CLIP_JOG_STOP)) {
@@ -467,10 +565,12 @@ function selectAnimation(): MovementAnimation {
       } else {
         return {
           src: CLIP_JOG_STOP,
-          speed: 1,
+          speed: settings.jogStopSpeed,
           loop: false,
           idle: false,
           transitionSeconds: settings.transWalk,
+          // Skip past the clip's opening step if tuned (jogStopStart > 0).
+          ...(newStop ? { playbackTime: settings.jogStopStart } : {}),
           sounds: [],
         };
       }
