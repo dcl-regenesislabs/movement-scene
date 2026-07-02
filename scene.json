@@ -7,9 +7,9 @@
     "navmapThumbnail": "images/scene-thumbnail.png",
     "favicon": "favicon_asset"
   },
-  "owner": "",
+  "owner": "DCLRegenesisLabs",
   "contact": {
-    "name": "",
+    "name": "DCL Regenesis Labs",
     "email": ""
   },
   "main": "bin/game.js",
