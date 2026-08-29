@@ -7,6 +7,8 @@
 //   - one glider clip, renamed to contain `_Prop` (engine: prop_anim)
 // Inputs are the pristine mesh-stripped avatar clips + Glider.glb; outputs are *Rig.glb
 // so this stays re-runnable. Run from project root: node source/merge-glider-into-avatar.mjs
+// The glider textures are shared files, not embedded (assets/animations/textures/), but writing a
+// GLB re-embeds them — so always follow this with `python3 externalize-textures.py` from source/.
 import { NodeIO } from '@gltf-transform/core';
 import { mergeDocuments } from '@gltf-transform/functions';
 
