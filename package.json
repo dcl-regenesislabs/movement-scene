@@ -3,7 +3,8 @@
   "description": "ECS7 ",
   "version": "1.0.0",
   "dependencies": {
-    "@dcl/sdk": "https://sdk-team-cdn.decentraland.org/@dcl/js-sdk-toolchain/branch/1456/merge/dcl-sdk-7.24.5-29260658645.commit-31d340c.tgz"
+    "@dcl/sdk": "7.27.1-33247605236.commit-732120a",
+    "@dcl/js-runtime": "7.27.1-33247605236.commit-732120a"
   },
   "overrides": {
     "@dcl/asset-packs": "2.15.3"
