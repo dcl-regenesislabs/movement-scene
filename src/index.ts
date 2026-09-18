@@ -153,6 +153,11 @@ export var prevPlayerPosition: Vector3 = Vector3.Zero();
 export var playerRotation: Quaternion = Quaternion.Identity();
 
 export var velocity = Vector3.Zero();
+// True on frames where the engine moved the player itself (movePlayerTo lerp / teleport,
+// or a platform carry) while consuming none of our velocity. Gravity and snap-to-ground
+// are skipped and the grounded state is held, so the lerp neither asserts a fall velocity
+// (which would cancel the engine move) nor arms a landing on arrival.
+export var engineDriven = false;
 export var velocityNorm = Vector3.Zero();
 export var velocityLength = 0;
 export var prevRequestedVelocity = Vector3.Zero();
@@ -190,12 +195,14 @@ function initFrame() {
   updateEngineWalk(movementInfo?.walkTarget, movementInfo?.walkThreshold);
 
   // If we are not in control (engine consumed a different velocity than we
-  // published), resync velocity to prevActual. Also reset prevRequestedVelocity
-  // so snap-to-ground is suppressed on this same tick.
-  if (Vector3.distance(lastPublished, prevRequestedVelocity) > 0.1 || movementInfo?.requestedVelocity === undefined) {
+  // published), resync velocity to prevActual.
+  const notInControl = Vector3.distance(lastPublished, prevRequestedVelocity) > 0.1 || movementInfo?.requestedVelocity === undefined;
+  if (notInControl) {
     Vector3.copyFrom(prevActualVelocity, velocity);
     Vector3.copyFrom(prevActualVelocity, prevRequestedVelocity);
   }
+  engineDriven = movementInfo?.requestedVelocity === undefined
+    && Vector3.distanceSquared(prevPlayerPosition, playerPosition) > 1e-8;
 }
 
 // Tracks the last jumpStartHeight we observed so we can detect a new jump
@@ -428,7 +435,7 @@ function landingAnimation(justLanded: boolean): MovementAnimation | null {
       src: landingClip,
       speed: landingSpeed,
       loop: false,
-      idle: false,
+      idle: true,
       transitionSeconds: settings.transAir,
       playbackTime: landingSoft ? settings.softLandStart : 0,
       sounds: drop > 0.5 ? [pickRandom(LAND_SOUNDS)] : [],
@@ -456,7 +463,7 @@ function landingAnimation(justLanded: boolean): MovementAnimation | null {
     landingClip = undefined;
     return null;
   }
-  return { src: clip, speed: landingSpeed, loop: false, idle: false, transitionSeconds: settings.transAir, sounds: [] };
+  return { src: clip, speed: landingSpeed, loop: false, idle: true, transitionSeconds: settings.transAir, sounds: [] };
 }
 
 // Detects whether the clip's playback time crossed any of the given trigger

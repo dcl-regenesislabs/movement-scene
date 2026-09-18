@@ -2,7 +2,7 @@ import { ColliderLayer, engine, Entity, InputAction, inputSystem, RaycastQueryTy
 import { Vector3 } from '@dcl/sdk/math';
 import { groundDistance, grounded, GROUNDED_ANGLE_Y_LEN, lastGroundTime, prevGrounded, setGrounded } from './ground';
 import { JUMP_DECEL_TIME, GRAVITY, GROUND_SNAP_HEIGHT, JUMP_COYOTE_TIME, JUMP_SPEED, MAX_STEP_HEIGHT, MIN_STEP_HEIGHT, PLAYER_COLLIDER_RADIUS, JUMP_SPEED_SPRINT, STEP_CLEARANCE_EXCESS, VEC3_ZERO, DOUBLE_JUMP_HANG_TIME, DOUBLE_JUMP_SPEED, GLIDE_DAMP_TIME } from './constants';
-import { playerPosition, prevActualVelocity, prevRequestedVelocity, prevStepTime, stepTime, time, velocity } from '.';
+import { engineDriven, playerPosition, prevActualVelocity, prevRequestedVelocity, prevStepTime, stepTime, time, velocity } from '.';
 import { movementAxis } from './horizontal';
 import { doubleJumpHeight, glideEnabled, glidingFallingSpeed, jogSpeed, jumpHeight, maxAirJumps, maxGroundJumps, sprintJumpHeight, sprintSpeed } from './parameters';
 
@@ -11,6 +11,14 @@ const JUMP_DECEL = JUMP_SPEED / JUMP_DECEL_TIME;
 const GRAVITY_DIR = Vector3.normalize(GRAVITY);
 
 export function updateVerticalVelocity() {
+  if (engineDriven) {
+    // Hold the grounded state while the engine drives us (see engineDriven): a lerp lifting
+    // us off the ground must not read as a fall, nor arrive as a landing. A jump press still
+    // goes through so the player can cancel the move.
+    setGrounded(prevGrounded);
+    applyJump();
+    return;
+  }
   stepUp();
   applyGravity();
   applyJump();
